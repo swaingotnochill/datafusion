@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use crate::object_storage::{AwsOptions, GcpOptions};
 use datafusion::{
     dataframe::DataFrame,
     error::DataFusionError,
@@ -25,8 +26,6 @@ use datafusion::{
     prelude::SessionContext,
 };
 use object_store::ObjectStore;
-
-use crate::object_storage::{AwsOptions, GcpOptions};
 
 #[async_trait::async_trait]
 /// The CLI session context trait provides a way to have a session context that can be used with datafusion's CLI code.

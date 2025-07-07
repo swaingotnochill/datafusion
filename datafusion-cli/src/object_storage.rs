@@ -15,11 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::{
+    any::Any,
+    collections::HashMap,
+    error::Error,
+    fmt::{Debug, Display},
+    ops::Range,
+    sync::Arc,
+};
+
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::provider::{
     error::CredentialsError, ProvideCredentials, SharedCredentialsProvider,
 };
+use bytes::Bytes;
 use datafusion::{
     common::{
         config::ConfigEntry, config::ConfigExtension, config::ConfigField,
@@ -29,21 +39,19 @@ use datafusion::{
     error::{DataFusionError, Result},
     execution::context::SessionState,
 };
+use futures::stream::BoxStream;
 use log::debug;
 use object_store::{
     aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential},
     gcp::GoogleCloudStorageBuilder,
     http::HttpBuilder,
+    path::Path,
     ClientOptions, CredentialProvider,
     Error::Generic,
-    ObjectStore,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult,
 };
-use std::{
-    any::Any,
-    error::Error,
-    fmt::{Debug, Display},
-    sync::Arc,
-};
+use tokio::sync::RwLock;
 use url::Url;
 
 #[cfg(not(test))]
@@ -56,6 +64,118 @@ async fn resolve_bucket_region(
     _client_options: &ClientOptions,
 ) -> object_store::Result<String> {
     Ok("eu-central-1".to_string())
+}
+
+/// An object store that caches Parquet metadata
+#[derive(Debug)]
+pub struct CachingObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    cache: Arc<RwLock<HashMap<(Path, Range<u64>), Bytes>>>,
+}
+
+impl CachingObjectStore {
+    pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
+impl Display for CachingObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CachingObjectStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CachingObjectStore {
+    async fn put(
+        &self,
+        location: &Path,
+        bytes: PutPayload,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put(location, bytes).await
+    }
+
+    async fn put_opts(
+        &self,
+        location: &Path,
+        bytes: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, bytes, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_range(
+        &self,
+        location: &Path,
+        range: Range<u64>,
+    ) -> object_store::Result<Bytes> {
+        let cache_key = (location.clone(), range.clone());
+        let cache = self.cache.read().await;
+        if let Some(bytes) = cache.get(&cache_key) {
+            return Ok(bytes.clone());
+        }
+        drop(cache);
+
+        let bytes = self.inner.get_range(location, range).await?;
+
+        let mut cache = self.cache.write().await;
+        cache.insert(cache_key, bytes.clone());
+
+        Ok(bytes)
+    }
+
+    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(
+        &self,
+        from: &Path,
+        to: &Path,
+    ) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
 }
 
 pub async fn get_s3_object_store_builder(
@@ -560,7 +680,7 @@ pub(crate) async fn get_object_store(
                 })?
         }
     };
-    Ok(store)
+    Ok(Arc::new(CachingObjectStore::new(store)))
 }
 
 #[cfg(test)]
